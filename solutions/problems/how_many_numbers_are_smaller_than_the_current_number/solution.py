@@ -1,11 +1,14 @@
 class Solution:
     def smallerNumbersThanCurrent(self, nums: List[int]) -> List[int]:
-        Map = {}
-        nums_sort = sorted(nums)
-        for i in range(len(nums)):
-            if nums_sort[i] not in Map:
-                Map[nums_sort[i]] = i
-        for i in range(len(nums)):
-            nums[i] = Map[nums[i]]
-        return nums
-        
+        count = [0] * 101 # index = number
+        for num in nums:
+            count[num] += 1
+        for i in range(1, 101):
+            count[i] += count[i-1]
+        res = []
+        for num in nums:
+            if num == 0:
+                res.append(0)
+            else:
+                res.append(count[num - 1])
+        return res
