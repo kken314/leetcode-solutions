@@ -9,19 +9,8 @@ class Solution:
         slow = head
         fast = head
         while fast and fast.next:
-            slow = slow.next
             fast = fast.next.next
-            if slow == fast:
+            slow = slow.next
+            if fast == slow:
                 return True
         return False
-
-# class Solution:
-#     def hasCycle(self, head: Optional[ListNode]) -> bool:
-#         linkList = []
-#         curr = head
-#         while curr:
-#             if curr.next in linkList:
-#                 return True
-#             linkList.append(curr)
-#             curr = curr.next
-#         return False
