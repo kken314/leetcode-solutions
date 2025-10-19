@@ -8,33 +8,28 @@ class Solution:
         """
         Do not return anything, modify head in-place instead.
         """
-        # find mid point
-        slow = head
         fast = head
+        slow = head
         while fast and fast.next:
             fast = fast.next.next
             slow = slow.next
-        # disconnect
         second = slow.next
         slow.next = None
-        # reverse second half
         prev = None
         while second:
-            front = second.next
+            temp = second.next
             second.next = prev
             prev = second
-            second = front
-        # merge
-        first = head
+            second = temp
         second = prev
+        first = head
+        front = first.next
         while second:
-            front1 = first.next
+            temp1 = first.next
             first.next = second
 
-            front2 = second.next
-            second.next = front1
+            temp2 = second.next
+            second.next = temp1
 
-            first = front1
-            second = front2
-            
-            
+            first = temp1
+            second = temp2
