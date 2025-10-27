@@ -1,19 +1,27 @@
 class Solution:
     def numIslands(self, grid: List[List[str]]) -> int:
-        row = len(grid)
-        col = len(grid[0])
-        count = 0
-        def delete_land(grid, r, c):
-            if r < 0 or c < 0 or r >= row or c >= col or grid[r][c] != '1':
-                return
-            grid[r][c] = '0'
-            delete_land(grid, r + 1, c)
-            delete_land(grid, r - 1, c)
-            delete_land(grid, r, c + 1)
-            delete_land(grid, r, c - 1)
-        for r in range(row):
-            for c in range(col):
-                if grid[r][c] == '1':
-                    delete_land(grid, r, c)
-                    count += 1
-        return count
+        islands = 0
+        rows = len(grid)
+        cols = len(grid[0])
+
+        def bfs(row, col):
+            q = deque()
+            q.append((row, col))
+            while q:
+                r, c = q.pop()
+                grid[r][c] = '0'
+                if r - 1 in range(rows) and c in range(cols) and grid[r - 1][c] == '1':
+                    q.append((r - 1, c))
+                if r + 1 in range(rows) and c in range(cols) and grid[r + 1][c] == '1':
+                    q.append((r + 1, c))
+                if r in range(rows) and c - 1 in range(cols) and grid[r][c - 1] == '1':
+                    q.append((r, c - 1))
+                if r in range(rows) and c + 1 in range(cols) and grid[r][c + 1] == '1':
+                    q.append((r, c + 1))
+
+        for row in range(rows):
+            for col in range(cols):
+                if grid[row][col] == '1':
+                    bfs(row, col)
+                    islands += 1
+        return islands
