@@ -1,16 +1,31 @@
 class Solution {
 public:
     int findDuplicate(vector<int>& nums) {
+        int slow = 0;
+        int fast = 0;
+
         while (true) {
-            if (nums[0] == nums[nums[0]]) {
+            slow = nums[slow];
+            fast = nums[fast];
+            fast = nums[fast];
+            //cout << "slow : " << slow << " fast : " << fast << endl;
+            if (slow == fast) {
                 break;
-            } else {
-                int temp = nums[0];
-                nums[0] = nums[nums[0]];
-                nums[temp] = temp;
             }
         }
 
-        return nums[0];
+        //cout << endl << "Intercept found" << endl << endl;
+
+        int head = 0;
+        while (true) {
+            slow = nums[slow];
+            head = nums[head];
+            //cout << "slow : " << slow << " head : " << head << endl;
+            if (head == slow) {
+                break;
+            }
+        }
+
+        return head;
     }
 };
