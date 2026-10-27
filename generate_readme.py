@@ -1,214 +1,412 @@
+import json
 import os
 import re
-import json
 import subprocess
 import urllib.parse
+from pathlib import Path
+
 import requests
 
-# กำหนด Path ของโฟลเดอร์โจทย์
-solutions_path = "solutions/problems"
-if not os.path.exists(solutions_path):
-    solutions_path = "solutions"
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+SOLUTIONS_PATH = Path("solutions/problems")
+if not SOLUTIONS_PATH.is_dir():
+    SOLUTIONS_PATH = Path("solutions")
 
-folders = [d for d in os.listdir(solutions_path) if os.path.isdir(os.path.join(solutions_path, d))]
+README_PATH = Path("README.md")
+EASY_PATH = Path("EASY.md")
+MEDIUM_PATH = Path("MEDIUM.md")
+HARD_PATH = Path("HARD.md")
 
-print(f"พบโฟลเดอร์โจทย์ทั้งหมด {len(folders)} ข้อ กำลังดึงข้อมูลจาก LeetCode API...")
+LEETCODE_API = "https://leetcode.com/api/problems/algorithms/"
+TAGS_DATASET_URL = (
+    "https://raw.githubusercontent.com/WilliamZhang20/"
+    "leetcode-clusters/master/data/problems.json"
+)
+REQUEST_TIMEOUT = 20
 
-# ดึงข้อมูลปัญหาทั้งหมดจาก LeetCode API
-url = "https://leetcode.com/api/problems/algorithms/"
-response = requests.get(url)
-data = response.json()
+DIFFICULTY = {1: "Easy", 2: "Medium", 3: "Hard"}
+DIFFICULTY_EMOJI = {"Easy": "🟢", "Medium": "🟡", "Hard": "🔴"}
+DIFFICULTY_BADGE = {
+    "Easy": "🟢 Easy",
+    "Medium": "🟡 Medium",
+    "Hard": "🔴 Hard",
+    "Unknown": "⚪ Unknown",
+    "-": "➖",
+}
 
-def normalize_key(s):
-    return re.sub(r'[^a-z0-9]', '', s.lower())
 
-# ดึงข้อมูล Topics / Tags
-print("กำลังดึงข้อมูล Topics / Tags...")
-tags_dataset_url = "https://raw.githubusercontent.com/WilliamZhang20/leetcode-clusters/master/data/problems.json"
-tags_map = {}
-try:
-    tags_resp = requests.get(tags_dataset_url, timeout=15)
-    if tags_resp.status_code == 200:
-        clusters_data = tags_resp.json()
-        tag_name_lookup = {t['slug']: t['name'] for t in clusters_data.get('tags', [])}
-        for p in clusters_data.get('problems', []):
-            p_tags = [tag_name_lookup.get(t, t.title()) for t in p.get('tags', [])]
-            tags_map[p['slug']] = p_tags
-            tags_map[normalize_key(p['slug'])] = p_tags
-            tags_map[normalize_key(p['title'])] = p_tags
-except Exception as e:
-    print(f"คำเตือน: ไม่สามารถดึง tags dataset ได้ ({e})")
+def normalize_key(value: str) -> str:
+    """Normalize names/slugs to make folder matching more forgiving."""
+    return re.sub(r"[^a-z0-9]", "", value.lower())
 
-def fetch_tags_fallback(slug):
+
+def get_json(url: str, *, timeout: int = REQUEST_TIMEOUT):
+    response = requests.get(
+        url,
+        timeout=timeout,
+        headers={"User-Agent": "Mozilla/5.0 LeetCode-README-Generator"},
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def load_problem_map():
+    """Fetch LeetCode's problem catalogue and index it by slug/title."""
+    print("🌐 Fetching LeetCode problem catalogue...")
+    payload = get_json(LEETCODE_API)
+    problem_map = {}
+
+    for item in payload.get("stat_status_pairs", []):
+        stat = item.get("stat", {})
+        title = stat.get("question__title", "").strip()
+        slug = stat.get("question__title_slug", "")
+        question_id = stat.get("frontend_question_id")
+
+        if not title or not slug or question_id is None:
+            continue
+
+        problem = {
+            "id": int(question_id),
+            "title": title,
+            "difficulty": DIFFICULTY.get(
+                item.get("difficulty", {}).get("level"), "Unknown"
+            ),
+            "slug": slug,
+        }
+        problem_map[slug] = problem
+        problem_map[normalize_key(slug)] = problem
+        problem_map[normalize_key(title)] = problem
+
+    return problem_map
+
+
+def load_tags_map():
+    """Load topic tags from the community dataset; gracefully fall back if absent."""
+    print("🏷️  Fetching topic tags...")
+    tags_map = {}
+
     try:
-        query = 'query { question(titleSlug: "%s") { topicTags { name } } }' % slug
-        cmd = [
-            'curl', '-s', '-X', 'POST', 'https://leetcode.com/graphql',
-            '-H', 'Content-Type: application/json',
-            '-H', 'Referer: https://leetcode.com',
-            '-H', 'Origin: https://leetcode.com',
-            '-H', 'User-Agent: Mozilla/5.0',
-            '-d', json.dumps({'query': query})
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        qdata = json.loads(res.stdout)
-        return [t['name'] for t in qdata.get('data', {}).get('question', {}).get('topicTags', [])]
-    except Exception:
+        payload = get_json(TAGS_DATASET_URL, timeout=15)
+        tag_names = {
+            tag.get("slug"): tag.get("name")
+            for tag in payload.get("tags", [])
+            if tag.get("slug") and tag.get("name")
+        }
+
+        for problem in payload.get("problems", []):
+            slug = problem.get("slug", "")
+            title = problem.get("title", "")
+            tags = [
+                tag_names.get(tag, tag.replace("-", " ").title())
+                for tag in problem.get("tags", [])
+            ]
+
+            if slug:
+                tags_map[slug] = tags
+                tags_map[normalize_key(slug)] = tags
+            if title:
+                tags_map[normalize_key(title)] = tags
+
+    except (requests.RequestException, ValueError, KeyError, TypeError) as error:
+        print(f"⚠️  Topic dataset unavailable: {error}")
+
+    return tags_map
+
+
+def fetch_tags_fallback(slug: str):
+    """Query LeetCode GraphQL for tags if the community dataset has no entry."""
+    query = """
+    query questionTopics($titleSlug: String!) {
+      question(titleSlug: $titleSlug) {
+        topicTags { name }
+      }
+    }
+    """
+    try:
+        response = requests.post(
+            "https://leetcode.com/graphql",
+            json={"query": query, "variables": {"titleSlug": slug}},
+            headers={
+                "Content-Type": "application/json",
+                "Referer": "https://leetcode.com",
+                "User-Agent": "Mozilla/5.0",
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        question = payload.get("data", {}).get("question") or {}
+        return [tag["name"] for tag in question.get("topicTags", [])]
+    except (requests.RequestException, ValueError, KeyError, TypeError):
         return []
 
-# สร้าง Map จับคู่ด้วย title_slug และ title
-problem_map = {}
-for p in data['stat_status_pairs']:
-    title_slug = p['stat']['question__title_slug']
-    question_id = int(p['stat']['frontend_question_id'])
-    title = p['stat']['question__title'].strip()
-    
-    level_dict = {1: "Easy", 2: "Medium", 3: "Hard"}
-    difficulty = level_dict.get(p['difficulty']['level'], "Unknown")
-    
-    item = {
-        "id": question_id,
-        "title": title,
-        "difficulty": difficulty,
-        "slug": title_slug
-    }
-    problem_map[title_slug] = item
-    problem_map[normalize_key(title_slug)] = item
-    problem_map[normalize_key(title)] = item
 
-# รวบรวมข้อมูลโจทย์ พร้อมแมตช์เลขข้อและ Topics
-solved_problems = []
-
-for folder in folders:
+def find_problem(folder: str, problem_map: dict):
+    """Match a solution folder to LeetCode's slug/title catalogue."""
     slug = folder.replace("_", "-").lower()
-    norm_key = normalize_key(folder)
-    info = problem_map.get(slug) or problem_map.get(norm_key)
-    
-    folder_encoded = urllib.parse.quote(folder)
-    link = f"[Code](./{solutions_path}/{folder_encoded})"
-    
-    # ค้นหา Tags ของโจทย์
-    tags = tags_map.get(slug) or tags_map.get(norm_key)
-    if tags is None and info:
-        tags = fetch_tags_fallback(info["slug"])
-    tags = tags or []
-    
-    if info:
-        solved_problems.append({
-            "id": info["id"],
-            "title": info["title"],
-            "difficulty": info["difficulty"],
-            "tags": tags,
-            "link": link
-        })
-    else:
-        solved_problems.append({
-            "id": 9999,
-            "title": folder,
-            "difficulty": "-",
-            "tags": tags,
-            "link": link
-        })
+    return problem_map.get(slug) or problem_map.get(normalize_key(folder))
 
-# เรียงลำดับตามหมายเลขข้อ (ID) จากน้อยไปมาก
-solved_problems = sorted(solved_problems, key=lambda x: x["id"])
+
+def markdown_escape(value: str) -> str:
+    """Keep titles/tags from breaking Markdown tables."""
+    return str(value).replace("|", r"\|").replace("\n", " ")
+
+
+def code_link(folder: str) -> str:
+    encoded = urllib.parse.quote(folder)
+    return f"[View Code ↗](./{SOLUTIONS_PATH.as_posix()}/{encoded})"
+
 
 def generate_markdown_table(problem_list, include_difficulty=True):
     if include_difficulty:
-        header = "| No | Name | Difficulty | Topics | Code Link |\n| :---: | :--- | :---: | :--- | :---: |\n"
-        rows = []
-        for p in problem_list:
-            qid = p["id"] if p["id"] != 9999 else "-"
-            tags_formatted = ", ".join([f"`{t}`" for t in p["tags"]]) if p["tags"] else "-"
-            rows.append(f"| {qid} | {p['title']} | {p['difficulty']} | {tags_formatted} | {p['link']} |")
+        header = (
+            "| # | Problem | Difficulty | Topics | Solution |\n"
+            "|:--:|:---|:--:|:---|:--:|\n"
+        )
     else:
-        header = "| No | Name | Topics | Code Link |\n| :---: | :--- | :--- | :---: |\n"
-        rows = []
-        for p in problem_list:
-            qid = p["id"] if p["id"] != 9999 else "-"
-            tags_formatted = ", ".join([f"`{t}`" for t in p["tags"]]) if p["tags"] else "-"
-            rows.append(f"| {qid} | {p['title']} | {tags_formatted} | {p['link']} |")
+        header = (
+            "| # | Problem | Topics | Solution |\n"
+            "|:--:|:---|:---|:--:|\n"
+        )
+
+    rows = []
+    for problem in problem_list:
+        question_id = problem["id"] if problem["id"] != 9999 else "—"
+        title = markdown_escape(problem["title"])
+        topics = ", ".join(
+            f"`{markdown_escape(tag)}`" for tag in problem["tags"]
+        ) or "—"
+        link = problem["link"]
+
+        if include_difficulty:
+            difficulty = DIFFICULTY_BADGE.get(
+                problem["difficulty"], problem["difficulty"]
+            )
+            rows.append(
+                f"| {question_id} | {title} | {difficulty} | {topics} | {link} |"
+            )
+        else:
+            rows.append(f"| {question_id} | {title} | {topics} | {link} |")
+
     return header + "\n".join(rows) + "\n"
 
-easy_problems = [p for p in solved_problems if p["difficulty"] == "Easy"]
-medium_problems = [p for p in solved_problems if p["difficulty"] == "Medium"]
-hard_problems = [p for p in solved_problems if p["difficulty"] == "Hard"]
 
-# ----------------- สร้างเนื้อหา README.md -----------------
-markdown_content = "# LeetCode Solutions\n\n"
+def build_problem_list(problem_map, tags_map):
+    if not SOLUTIONS_PATH.is_dir():
+        raise FileNotFoundError(
+            f"Cannot find a solutions directory. Checked: "
+            f"'solutions/problems' and 'solutions'."
+        )
 
-# # ส่วนที่ 1: ประวัติความเป็นมา
-# markdown_content += "## My LeetCode Journey\n\n"
-# markdown_content += "- **April 8, 2025:** Started solving LeetCode problems as a new hobby during the school break.\n"
-# markdown_content += "- **End of 2025:** Reached a net total of 643 solved problems.\n"
-# markdown_content += "- **May 21, 2026:** Successfully crossed the milestone of 1,000 solved problems!\n"
-# markdown_content += "- **Purpose:** This repository serves as a personal archive to store and showcase all the coding solutions I've submitted.\n\n"
+    folders = sorted(
+        path.name for path in SOLUTIONS_PATH.iterdir() if path.is_dir()
+    )
+    print(f"📂 Found {len(folders)} solution folders.")
 
-# ส่วนที่ 2: สถิติแยกตามความยาก (พร้อมลิงก์ไปยังไฟล์แยก)
-markdown_content += "## Problems by Difficulty\n\n"
-markdown_content += f"- 🟢 **[Easy Problems ({len(easy_problems)})](./EASY.md)**\n"
-markdown_content += f"- 🟡 **[Medium Problems ({len(medium_problems)})](./MEDIUM.md)**\n"
-markdown_content += f"- 🔴 **[Hard Problems ({len(hard_problems)})](./HARD.md)**\n\n"
+    problems = []
+    for folder in folders:
+        info = find_problem(folder, problem_map)
+        slug = info["slug"] if info else folder.replace("_", "-").lower()
+        key = normalize_key(folder)
 
-# ส่วนที่ 3: สถิติและตารางสารบัญรวม
-markdown_content += f"## Table of Contents ({len(folders)} Problems)\n\n"
-markdown_content += generate_markdown_table(solved_problems, include_difficulty=True)
+        tags = tags_map.get(slug)
+        if tags is None:
+            tags = tags_map.get(key)
+        if tags is None and info:
+            tags = fetch_tags_fallback(info["slug"])
+        tags = tags or []
 
-# ส่วนที่ 4: คู่มือสำหรับคนที่อยากทำตาม
-markdown_content += "\n----\n\n"
-markdown_content += "## How to Set This Up Yourself\n\n"
-markdown_content += "If you want to sync your LeetCode submissions to GitHub and generate an organized README like this, follow these steps:\n\n"
-markdown_content += "### 1. Automated Sync via GitHub Actions\n"
-markdown_content += "1. Create a new GitHub repository (e.g., `leetcode-solutions`).\n"
-markdown_content += "2. Get your LeetCode session cookies (`LEETCODE_SESSION` and `csrftoken`) from your browser's Developer Tools (`F12` -> Application -> Cookies -> `leetcode.com`).\n"
-markdown_content += "3. In your GitHub repository, go to **Settings** -> **Secrets and variables** -> **Actions**, and add two repository secrets:\n"
-markdown_content += "   - `LEETCODE_SESSION`\n"
-markdown_content += "   - `CSRF_TOKEN`\n"
-markdown_content += "4. Create a GitHub Action workflow file at `.github/workflows/leetcode.yml` with the following configuration:\n\n"
-markdown_content += "```yaml\n"
-markdown_content += "name: Sync LeetCode\n\n"
-markdown_content += "on:\n"
-markdown_content += "  workflow_dispatch:\n"
-markdown_content += "  schedule:\n"
-markdown_content += "    - cron: \"0 0 * * *\"\n\n"
-markdown_content += "jobs:\n"
-markdown_content += "  build:\n"
-markdown_content += "    runs-on: ubuntu-latest\n"
-markdown_content += "    steps:\n"
-markdown_content += "      - uses: actions/checkout@v4\n"
-markdown_content += "      - uses: joshcai/leetcode-sync@v1.5\n"
-markdown_content += "        with:\n"
-markdown_content += "          github-token: ${{ secrets.GITHUB_TOKEN }}\n"
-markdown_content += "          leetcode-session: ${{ secrets.LEETCODE_SESSION }}\n"
-markdown_content += "          leetcode-csrf-token: ${{ secrets.CSRF_TOKEN }}\n"
-markdown_content += "          destination-folder: \"solutions\"\n"
-markdown_content += "```\n\n"
-markdown_content += "### 2. Generate README.md Automatically\n"
-markdown_content += "You can use a Python script to scan your solution folders, fetch problem details (ID, title, difficulty) from the LeetCode API, sort them, and update your `README.md` automatically.\n"
+        problems.append({
+            "id": info["id"] if info else 9999,
+            "title": info["title"] if info else folder.replace("_", " ").title(),
+            "difficulty": info["difficulty"] if info else "Unknown",
+            "tags": tags,
+            "link": code_link(folder),
+        })
 
-# บันทึกไฟล์ README.md
-with open("README.md", "w", encoding="utf-8") as f:
-    f.write(markdown_content)
+    return sorted(problems, key=lambda problem: (problem["id"], problem["title"]))
 
-# บันทึกไฟล์ EASY.md
-easy_content = f"# 🟢 LeetCode Easy Problems ({len(easy_problems)})\n\n"
-easy_content += "[⬅️ Back to All Problems](./README.md) | [Medium Problems 🟡](./MEDIUM.md) | [Hard Problems 🔴](./HARD.md)\n\n"
-easy_content += generate_markdown_table(easy_problems, include_difficulty=False)
-with open("EASY.md", "w", encoding="utf-8") as f:
-    f.write(easy_content)
 
-# บันทึกไฟล์ MEDIUM.md
-medium_content = f"# 🟡 LeetCode Medium Problems ({len(medium_problems)})\n\n"
-medium_content += "[Easy Problems 🟢](./EASY.md) | [⬅️ Back to All Problems](./README.md) | [Hard Problems 🔴](./HARD.md)\n\n"
-medium_content += generate_markdown_table(medium_problems, include_difficulty=False)
-with open("MEDIUM.md", "w", encoding="utf-8") as f:
-    f.write(medium_content)
+def difficulty_card(emoji, label, count, filename):
+    return (
+        f'<a href="{filename}">'
+        f'<img src="https://img.shields.io/badge/{label}-{count}-'
+        f'{ {"Easy": "2ea44f", "Medium": "d4a72c", "Hard": "cf222e"}[label] }'
+        f'?style=for-the-badge&logo=leetcode&logoColor=white" alt="{label} problems">'
+        f"</a>"
+    )
 
-# บันทึกไฟล์ HARD.md
-hard_content = f"# 🔴 LeetCode Hard Problems ({len(hard_problems)})\n\n"
-hard_content += "[Easy Problems 🟢](./EASY.md) | [Medium Problems 🟡](./MEDIUM.md) | [⬅️ Back to All Problems](./README.md)\n\n"
-hard_content += generate_markdown_table(hard_problems, include_difficulty=False)
-with open("HARD.md", "w", encoding="utf-8") as f:
-    f.write(hard_content)
 
-print(f"สร้างไฟล์ README.md, EASY.md ({len(easy_problems)}), MEDIUM.md ({len(medium_problems)}), HARD.md ({len(hard_problems)}) สำเร็จ!")
+def build_readme(problems, easy, medium, hard):
+    total = len(problems)
+    matched = sum(problem["id"] != 9999 for problem in problems)
+    unknown = total - matched
+
+    # SVG-style badge images and HTML are supported by GitHub README rendering.
+    content = [
+        '<div align="center">',
+        "",
+        "# ⚡ LeetCode — Problem Archive",
+        "",
+        "*A growing collection of solutions, patterns, and algorithm practice.*",
+        "",
+        f'<img src="https://img.shields.io/badge/Problems-{total}-blue?style=for-the-badge&logo=leetcode&logoColor=white" alt="Total problems">',
+        f'<img src="https://img.shields.io/badge/Easy-{len(easy)}-2ea44f?style=for-the-badge" alt="Easy">',
+        f'<img src="https://img.shields.io/badge/Medium-{len(medium)}-d4a72c?style=for-the-badge" alt="Medium">',
+        f'<img src="https://img.shields.io/badge/Hard-{len(hard)}-cf222e?style=for-the-badge" alt="Hard">',
+        "",
+        "[📚 Browse All](#-problem-index) · "
+        "[🟢 Easy](./EASY.md) · "
+        "[🟡 Medium](./MEDIUM.md) · "
+        "[🔴 Hard](./HARD.md)",
+        "",
+        "</div>",
+        "",
+        "---",
+        "",
+        "## 📊 Repository Overview",
+        "",
+        "| Metric | Count |",
+        "|:---|---:|",
+        f"| 🧩 Total solution folders | **{total}** |",
+        f"| 🟢 Easy | **{len(easy)}** |",
+        f"| 🟡 Medium | **{len(medium)}** |",
+        f"| 🔴 Hard | **{len(hard)}** |",
+        f"| 🔎 Matched with LeetCode catalogue | **{matched}** |",
+    ]
+
+    if unknown:
+        content.append(f"| ⚠️ Unmatched folders | **{unknown}** |")
+
+    content.extend([
+        "",
+        "## 🧭 Problems by Difficulty",
+        "",
+        "| Easy | Medium | Hard |",
+        "|:---:|:---:|:---:|",
+        f"| [🟢 **{len(easy)} problems**](./EASY.md) "
+        f"| [🟡 **{len(medium)} problems**](./MEDIUM.md) "
+        f"| [🔴 **{len(hard)} problems**](./HARD.md) |",
+        "",
+        "## 🧠 Problem Index",
+        "",
+        f"> Browse **{total}** solution folders, sorted by LeetCode problem number.",
+        "",
+        generate_markdown_table(problems, include_difficulty=True),
+        "",
+        "---",
+        "",
+        "<details>",
+        "<summary>⚙️ How this repository is generated</summary>",
+        "",
+        "This README is generated by a Python script that scans the solution folders, "
+        "matches problems against LeetCode's catalogue, and adds topic tags where available.",
+        "",
+        "### Run locally",
+        "",
+        "```bash",
+        "python generate_readme.py",
+        "```",
+        "",
+        "Install the dependency first if needed:",
+        "",
+        "```bash",
+        "python -m pip install requests",
+        "```",
+        "",
+        "### Optional GitHub Actions sync",
+        "",
+        "You can automate syncing with a workflow. Store `LEETCODE_SESSION` and "
+        "`CSRF_TOKEN` as repository Actions secrets; never commit session cookies "
+        "or tokens to source control.",
+        "",
+        "</details>",
+        "",
+        "<div align=\"center\">",
+        "",
+        "*Built with consistency, one problem at a time. 🚀*",
+        "",
+        "</div>",
+        "",
+    ])
+    return "\n".join(content)
+
+
+def build_difficulty_page(title, emoji, problems, other_links):
+    content = [
+        f"# {emoji} LeetCode {title} Problems",
+        "",
+        f"> **{len(problems)} problems** · Keep learning, keep shipping.",
+        "",
+        " | ".join(other_links),
+        "",
+        "---",
+        "",
+        generate_markdown_table(problems, include_difficulty=False),
+        "",
+        "[⬆️ Back to top](./README.md)",
+        "",
+    ]
+    return "\n".join(content)
+
+
+def write_file(path: Path, content: str):
+    path.write_text(content, encoding="utf-8")
+    print(f"✅ Generated {path}")
+
+
+def main():
+    if not SOLUTIONS_PATH.is_dir():
+        raise SystemExit(
+            "❌ Could not find 'solutions/problems' or 'solutions'. "
+            "Run this script from the repository root."
+        )
+
+    try:
+        problem_map = load_problem_map()
+    except (requests.RequestException, ValueError) as error:
+        raise SystemExit(
+            f"❌ Could not fetch the LeetCode catalogue: {error}\n"
+            "Check your internet connection and try again."
+        )
+
+    tags_map = load_tags_map()
+    problems = build_problem_list(problem_map, tags_map)
+
+    easy = [p for p in problems if p["difficulty"] == "Easy"]
+    medium = [p for p in problems if p["difficulty"] == "Medium"]
+    hard = [p for p in problems if p["difficulty"] == "Hard"]
+
+    write_file(README_PATH, build_readme(problems, easy, medium, hard))
+    write_file(
+        EASY_PATH,
+        build_difficulty_page(
+            "Easy", "🟢", easy,
+            ["[⬅️ All Problems](./README.md)", "[🟡 Medium](./MEDIUM.md)", "[🔴 Hard](./HARD.md)"],
+        ),
+    )
+    write_file(
+        MEDIUM_PATH,
+        build_difficulty_page(
+            "Medium", "🟡", medium,
+            ["[🟢 Easy](./EASY.md)", "[⬅️ All Problems](./README.md)", "[🔴 Hard](./HARD.md)"],
+        ),
+    )
+    write_file(
+        HARD_PATH,
+        build_difficulty_page(
+            "Hard", "🔴", hard,
+            ["[🟢 Easy](./EASY.md)", "[🟡 Medium](./MEDIUM.md)", "[⬅️ All Problems](./README.md)"],
+        ),
+    )
+
+    print(
+        f"\n🎉 Done! {len(problems)} problems indexed "
+        f"({len(easy)} Easy · {len(medium)} Medium · {len(hard)} Hard)."
+    )
+
+
+if __name__ == "__main__":
+    main()
